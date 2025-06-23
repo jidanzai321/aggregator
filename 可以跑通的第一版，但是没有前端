@@ -1,0 +1,237 @@
+# -*- coding: utf-8 -*-
+"""
+Cross‑Venue Crypto Order‑Book Aggregator  
+=========================================
+*⊗ 2025‑06‑07 · 完整稳定版*
+
+### 说明
+- 聚合 **8 家 CEX**（Binance、Kraken、Coinbase、OKX、Bybit、Bitstamp、KuCoin、Gate.io）+ **2 家链上限价簿 DEX**（dYdX v4、Serum）。
+- 默认币对：`BTC/USDT`, `ETH/USDT`；可在顶部 `SYMBOLS` 修改。  
+- 终端每秒打印 **中价 ±20 %** 区间，100 美元价桶汇总买/卖量。  
+- Redis 输出可选；未配置 `REDIS_URL` 时自动跳过。
+
+运行：
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -U ccxt websockets ujson aiohttp          # Redis 可选
+python aggregator.py
+```
+"""
+from __future__ import annotations
+import asyncio, json, logging, os, signal, shutil
+from typing import Dict, List
+
+# ---------------- USER CONFIG ---------------- #
+SYMBOLS      = ["BTC/USDT", "ETH/USDT"]
+CEXES        = [
+    "binance", "kraken", "coinbase",
+    "okx", "bybit", "bitstamp", "kucoin", "gateio"
+]
+DEPTH_LIMIT  = 1000    # 每本深度阶梯层数
+RANGE_PCT    = 0.20    # 打印中价 ±20 %
+BIN_SIZE     = 100     # 打印聚合桶宽（美元）
+REDIS_URL    = os.environ.get("REDIS_URL")  # None → 不输出 Redis
+# ------------------------------------------------ #
+
+import ccxt.pro as ccxtpro
+try:
+    import redis.asyncio as aioredis
+except ImportError:
+    aioredis = None
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("aggregator")
+
+# ---------------- 数据结构 -------------------- #
+Ladder = Dict[float, Dict[str, float]]  # {price: {bid, ask}}
+
+# =============== CEX 适配器 ==================== #
+class ExchangeAdapter:
+    def __init__(self, eid: str):
+        self.id = eid
+        self.ex  = getattr(ccxtpro, eid)({"enableRateLimit": True})
+        self.books: Dict[str, Ladder] = {}
+
+    async def stream(self, sym: str, tick: float):
+        while True:
+            try:
+                ob = await self.ex.watch_order_book(sym, limit=DEPTH_LIMIT)
+                self.books[sym] = self._ladder(ob, tick)
+            except Exception as e:
+                log.warning("%s:%s %s", self.id, sym, e)
+                await asyncio.sleep(5)
+
+    @staticmethod
+    def _ladder(ob, tick) -> Ladder:
+        lad: Ladder = {}
+        for side, key in [(ob["bids"], "bid"), (ob["asks"], "ask")]:
+            for price, qty in side:
+                p = round(price / tick) * tick
+                lad.setdefault(p, {"bid": 0.0, "ask": 0.0})[key] += qty
+        return lad
+
+# =============== dYdX v4 适配器 =============== #
+class DyDxAdapter:
+    URL = "wss://indexer.dydx.trade/v4/ws"
+    def __init__(self, market: str, tick: float):
+        self.market, self.tick = market, tick
+        self.ladder: Ladder = {}
+
+    async def run(self):
+        import websockets, ujson
+        async for ws in websockets.connect(self.URL, ping_interval=None):
+            try:
+                await ws.send(ujson.dumps({"type":"subscribe","channel":"orderbook","id":self.market}))
+                async for msg in ws:
+                    data = ujson.loads(msg)
+                    if data.get("type") == "snapshot":
+                        self.ladder = self._parse(data["data"], full=True)
+                    elif data.get("type") == "delta":
+                        delta = self._parse(data["data"], full=False)
+                        for p,d in delta.items():
+                            row = self.ladder.setdefault(p,{"bid":0.0,"ask":0.0})
+                            row["bid"] += d["bid"]
+                            row["ask"] += d["ask"]
+            except Exception as e:
+                log.warning("dYdX WS %s", e)
+                await asyncio.sleep(5)
+
+    def _parse(self, rows, full) -> Ladder:
+        lad: Ladder = {}
+        for side in ("bids","asks") if full else ("bidsDelta","asksDelta"):
+            key = "bid" if "bid" in side else "ask"
+            for price, qty in rows.get(side, []):
+                p = round(float(price)/self.tick)*self.tick
+                lad.setdefault(p,{"bid":0.0,"ask":0.0})[key] += float(qty)
+        return lad
+
+# ================ Serum 适配器 ================ #
+class SerumAdapter:
+    RPC = "https://solana-api.projectserum.com"
+    def __init__(self, market_addr: str, tick: float):
+        self.addr, self.tick = market_addr, tick
+        self.ladder: Ladder = {}
+
+    async def run(self):
+        import aiohttp
+        while True:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    payload = {"jsonrpc":"2.0","id":1,"method":"getOrderbook","params":[self.addr,{"limit":DEPTH_LIMIT}]}
+                    async with s.post(self.RPC, json=payload, timeout=10) as r:
+                        d = await r.json()
+                        if d.get("result"):
+                            self.ladder = self._parse(d["result"])
+            except Exception as e:
+                log.warning("Serum RPC %s", e)
+            await asyncio.sleep(1)
+
+    def _parse(self, res) -> Ladder:
+        lad: Ladder = {}
+        for side,key in [("bids","bid"),("asks","ask")]:
+            for price, qty, *_ in res.get(side, [])[:DEPTH_LIMIT]:
+                p = round(float(price)/self.tick)*self.tick
+                lad.setdefault(p,{"bid":0.0,"ask":0.0})[key] += float(qty)
+        return lad
+
+# ================ 聚合器核心 ================= #
+class Aggregator:
+    def __init__(self, tick: float):
+        self.tick = tick
+        self.redis = None
+
+    async def init_redis(self):
+        if REDIS_URL and aioredis:
+            try:
+                self.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+                await self.redis.ping()
+                log.info("Redis ➜ %s", REDIS_URL)
+            except Exception as e:
+                log.warning("Redis off (%s)", e)
+                self.redis = None
+
+    def merge(self, books: List[Ladder]) -> Ladder:
+        merged: Ladder = {}
+        for book in books:
+            for p,r in book.items():
+                merged.setdefault(p,{"bid":0.0,"ask":0.0})
+                merged[p]["bid"] += r.get("bid",0)
+                merged[p]["ask"] += r.get("ask",0)
+        return merged
+
+    async def show(self, sym: str, lad: Ladder):
+        if not lad: return
+        bid = max(p for p,r in lad.items() if r["bid"]>0)
+        ask = min(p for p,r in lad.items() if r["ask"]>0)
+        mid = (bid+ask)/2
+        spread = ask-bid
+        # header
+        cols = shutil.get_terminal_size().columns or 80
+        print("\n"+"="*cols)
+        print(f"{sym}  mid={mid:.2f}  spread={spread:.2f}  (±{int(RANGE_PCT*100)} % view)")
+        # bucket
+        low, high = mid*(1-RANGE_PCT), mid*(1+RANGE_PCT)
+        bucket: Dict[int, Dict[str,float]] = {}
+        for p,r in lad.items():
+            if low <= p <= high:
+                b = int(p//BIN_SIZE)*BIN_SIZE
+                bucket.setdefault(b,{"bid":0.0,"ask":0.0})
+                bucket[b]["bid"] += r["bid"]
+                bucket[b]["ask"] += r["ask"]
+        # print table
+        print(f"{'Price':>10} | {'BidQty':>12} | {'AskQty':>12}")
+        print("-"*38)
+        for price in sorted(bucket.keys(), reverse=True):
+            r = bucket[price]
+            print(f"{price:>10,.0f} | {r['bid']:>12,.3f} | {r['ask']:>12,.3f}")
+
+        # publish redis
+        if self.redis:
+            try:
+                await self.redis.publish(sym, json.dumps(lad))
+            except Exception as e:
+                log.warning("Redis pub %s", e)
+
+# ---------------------------- MAIN --------------------------- #
+async def main():
+    tick = 0.01
+    agg = Aggregator(tick)
+    await agg.init_redis()
+
+    # --- Start streams ---
+    cexs = [ExchangeAdapter(e) for e in CEXES]
+    cex_tasks = [asyncio.create_task(c.stream(sym, tick)) for c in cexs for sym in SYMBOLS]
+
+    dydx  = DyDxAdapter("BTC-USD", tick)   # dYdX 只对 BTC 示例
+    serum = SerumAdapter("9wFFo5AFZj7EBzLwGxFh8uRjwYwRApZW2Z7hJNPmT97z", tick)  # Serum BTC/USDC
+    dex_tasks = [asyncio.create_task(dydx.run()), asyncio.create_task(serum.run())]
+
+    async def loop():
+        while True:
+            for sym in SYMBOLS:
+                books = [c.books.get(sym, {}) for c in cexs]
+                if sym.startswith("BTC"):
+                    books += [dydx.ladder, serum.ladder]
+                merged = agg.merge(books)
+                await agg.show(sym, merged)
+            await asyncio.sleep(1)
+
+    loop_task = asyncio.create_task(loop())
+    tasks = [*cex_tasks, *dex_tasks, loop_task]
+
+    # Graceful shutdown
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                sig, lambda: [t.cancel() for t in tasks])
+        except NotImplementedError:
+            pass  # Windows 下不支持信号处理
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
